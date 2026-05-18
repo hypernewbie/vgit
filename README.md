@@ -3,6 +3,8 @@
 Self-hosted git server with bundle-based backup to Google Drive and SSH targets.
 Bare repos configured for partial-clone and bitmap indexes.
 
+> Vgit is AI coded slop. Do not use.
+
 ## Install
 
     go install github.com/hypernewbie/vgit@latest
