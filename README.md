@@ -19,10 +19,18 @@ One-time host setup. Creates `~/vgit/` (mode 700) with `repos/`, `bundles/`, and
 `config/` subdirs; verifies `git` and `rclone` are present; optionally runs the
 rclone OAuth flow for Google Drive.
 
-The gdrive auth flow uses `config_is_local=false` (no local OAuth helper port;
-prints a URL you open in any browser — works over SSH with no port forwarding)
-and `scope=drive.file` (rclone can read and manage only files it creates;
-cannot see the rest of your Drive).
+The gdrive auth uses `scope=drive.file` — rclone can read and manage only
+files it creates; it cannot see the rest of your Drive.
+
+**Installing over SSH**: rclone's OAuth callback binds `localhost:53682`. Open
+your session with port forwarding *before* running `vgit install` so the
+redirect from your laptop's browser can reach it:
+
+    ssh -L 53682:localhost:53682 <host>
+
+Then run `vgit install` in that session and answer **Y** to "Use auto config?".
+The paste-back flow (answer N) is brittle — token format depends on matching
+rclone versions on both ends — so port forwarding is the reliable path.
 
 Flags:
 

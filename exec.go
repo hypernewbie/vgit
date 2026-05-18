@@ -82,26 +82,53 @@ func rcloneAuthGdrive(configDir string) error {
 	configFile := filepath.Join(configDir, "rclone.conf")
 
 	fmt.Println("vgit: Setting up Google Drive authentication...")
-	fmt.Println("  rclone will print a URL — open it in any browser (works over SSH).")
+	fmt.Println()
+	fmt.Println("  OAuth needs a browser. If you're on SSH, two options:")
+	fmt.Println("    A) Easiest — re-SSH with port forwarding, then re-run vgit install:")
+	fmt.Println("         ssh -L 53682:localhost:53682 <this-host>")
+	fmt.Println("       rclone's local OAuth helper will work over the forwarded port.")
+	fmt.Println("    B) Headless — when rclone asks 'Use auto config?', answer N.")
+	fmt.Println("       Follow the printed instructions to run `rclone authorize` on")
+	fmt.Println("       a machine with a browser, then paste the resulting token here.")
+	fmt.Println()
 	fmt.Println("  Access is limited to files vgit creates (drive.file scope).")
 	fmt.Println()
 
+	// Step 1: create the remote stub with scope. Pass `config_is_local=false`
+	// so rclone doesn't fire its localhost OAuth helper at this point — we
+	// drive OAuth explicitly in step 2.
 	if err := runInteractive(
 		"rclone", "config", "create",
 		"gdrive",                // remote name
 		"drive",                 // remote type
-		"config_is_local=false", // remote-friendly: URL + paste-back-code, no localhost server
-		"scope=drive.file",      // only access files vgit creates; can't see the rest of Drive
+		"scope=drive.file",      // only access files vgit creates
+		"config_is_local=false", // skip the immediate localhost OAuth attempt
 		"--config", configFile,
 	); err != nil {
 		return fmt.Errorf("rclone config create: %w", err)
 	}
 
+	// Step 2: trigger the OAuth flow via `config reconnect`. This is the
+	// documented path for headless setups — rclone itself suggests it when
+	// a remote exists without a token. It runs interactively and asks
+	// 'Use auto config?' so the user can pick local vs paste-back.
+	fmt.Println()
+	fmt.Println("vgit: completing OAuth (rclone will prompt)...")
+	fmt.Println()
+	if err := runInteractive(
+		"rclone", "--config", configFile,
+		"config", "reconnect", "gdrive:",
+	); err != nil {
+		return fmt.Errorf("rclone config reconnect: %w", err)
+	}
+
 	// Verify the remote actually works before declaring success.
 	result, err := exec.Command("rclone", "--config", configFile, "lsd", "gdrive:").CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("gdrive auth verification failed (did you complete the OAuth flow?):\n  %s",
-			strings.TrimSpace(string(result)))
+		return fmt.Errorf("gdrive auth verification failed (did you complete the OAuth flow?):\n  %s\n\n"+
+			"  To retry without losing the rest of the install, run:\n"+
+			"    rclone --config %s config reconnect gdrive:",
+			strings.TrimSpace(string(result)), configFile)
 	}
 
 	if err := os.Chmod(configFile, 0o600); err != nil {
