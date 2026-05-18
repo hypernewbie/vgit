@@ -187,7 +187,7 @@ func listRepos(reposDir, bundlesDir string) ([]repoInfo, error) {
 			Name:       name,
 			Size:       humaniseBytes(size),
 			LastCommit: repoLastCommit(repoPath),
-			Bundle:     bundleInfo(filepath.Join(bundlesDir, name+".bundle")),
+			Bundle:     bundleInfo(filepath.Join(bundlesDir, name)),
 		})
 	}
 	sort.Slice(repos, func(i, j int) bool { return repos[i].Name < repos[j].Name })
@@ -226,12 +226,44 @@ func repoLastCommit(repoPath string) string {
 	return humaniseDuration(d)
 }
 
-func bundleInfo(bundlePath string) string {
-	info, err := os.Stat(bundlePath)
+// bundleInfo summarises the latest local staging bundle for a repo. The
+// staging dir contains full.bundle plus zero or more incr.NNN.bundle files
+// (the latest local mirror of one destination's chain). We report on the
+// newest file by mtime, plus the count of incrementals if any.
+func bundleInfo(stagingDir string) string {
+	entries, err := os.ReadDir(stagingDir)
 	if err != nil {
 		return dim("(none)")
 	}
-	return fmt.Sprintf("%s, %s", humaniseBytes(info.Size()), humaniseDuration(time.Since(info.ModTime())))
+	var newest os.FileInfo
+	incrCount := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		name := info.Name()
+		if !strings.HasSuffix(name, ".bundle") {
+			continue
+		}
+		if strings.HasPrefix(name, "incr.") {
+			incrCount++
+		}
+		if newest == nil || info.ModTime().After(newest.ModTime()) {
+			newest = info
+		}
+	}
+	if newest == nil {
+		return dim("(none)")
+	}
+	base := fmt.Sprintf("%s, %s", humaniseBytes(newest.Size()), humaniseDuration(time.Since(newest.ModTime())))
+	if incrCount > 0 {
+		return fmt.Sprintf("%s (+%d incr)", base, incrCount)
+	}
+	return base
 }
 
 // humaniseDuration formats a duration as a compact "Xs/m/h/d/mo/y ago" string.

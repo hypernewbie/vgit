@@ -68,12 +68,12 @@ Flags:
 
     --description string   Repository description (written to .git/description)
 
-### vgit backup <repo> <target>
+### vgit backup <repo> <target> [--full]
 
-Bundles `<repo>` with `git bundle create --all`, verifies the bundle, and
-uploads it to `<target>`. Each backup overwrites the previous bundle for that
-repo. The local copy stays at `~/vgit/bundles/<repo>.bundle` as a staging
-artefact.
+Default: **incremental** backup — only commits added since the last backup to
+this target get bundled and uploaded. The first backup to a fresh target
+auto-promotes to a full bundle. Pass `--full` to force a fresh full bundle and
+prune old incrementals from the destination.
 
 Target syntax:
 
@@ -82,20 +82,51 @@ Target syntax:
 
 Examples:
 
-    vgit backup a1 gdrive:vgit-backups/
+    vgit backup a1 gdrive:vgit-backups/                # incremental (or full if first)
+    vgit backup a1 gdrive:vgit-backups/ --full         # force fresh full, prune incrementals
     vgit backup a1 ssh:hypernewbie@hyperion:~/vgit_backup/
+
+Destination layout (per repo):
+
+    <target>/<repo>/full.bundle
+    <target>/<repo>/incr.001.bundle
+    <target>/<repo>/incr.002.bundle
+    ...
+
+State is tracked per-(repo, destination) inside the bare repo: a marker ref
+at `refs/vgit/dest/<hash>/marker` (synthetic octopus commit pointing to the
+tips at last backup) and a counter in `git config vgit.dest.<hash>.counter`.
+Two different targets get two independent chains.
 
 Errors fail fast and non-zero:
 
 - Unknown target prefix
 - Repo missing at `~/vgit/repos/<name>.git`
 - gdrive target requested but no gdrive remote in `vgit.toml`
+- Repo has no commits yet (incremental needs a base)
 - `git bundle verify` failure
 - Underlying rclone or rsync failure
 
+If nothing has changed since the last backup, vgit prints `nothing new to back up`
+and exits 0 without uploading.
+
 Run from cron for scheduled backups:
 
-    0 3 * * 0  /home/hypernewbie/go/bin/vgit backup a1 gdrive:vgit-backups/
+    0 3 * * *  /home/hypernewbie/go/bin/vgit backup a1 gdrive:vgit-backups/         # daily incremental
+    0 4 * * 0  /home/hypernewbie/go/bin/vgit backup a1 gdrive:vgit-backups/ --full  # weekly consolidation
+
+### Restoring from a bundle chain
+
+`vgit restore` is not yet automated. The manual procedure:
+
+    mkdir restored && cd restored
+    git clone /path/to/full.bundle .
+    for b in /path/to/incr.*.bundle; do
+        git fetch "$b" '+refs/*:refs/*'
+    done
+
+`git fetch <bundle> '+refs/*:refs/*'` updates every local ref from the
+bundle's ref list — branches and tags get force-updated to match the bundle.
 
 ## Cloning
 
@@ -115,7 +146,11 @@ clones.
 
     ~/vgit/
       repos/                Bare repos (created by `vgit init`)
-      bundles/              Local bundle staging (latest snapshot per repo)
+      bundles/
+        <repo>/             Per-repo local mirror of the latest backup chain
+          full.bundle
+          incr.001.bundle
+          ...
       config/
         vgit.toml           vgit's own config: install dir, configured remotes
         rclone.conf         rclone config + gdrive token (mode 600)

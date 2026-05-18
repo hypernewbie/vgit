@@ -472,6 +472,19 @@ func mustRun(t *testing.T, name string, args ...string) {
 	}
 }
 
+// pushCommitToRepo adds an empty commit and pushes it to the bare repo at
+// <installDir>/repos/<repo>.git, for tests that need to make the repo evolve
+// between backups.
+func pushCommitToRepo(t *testing.T, installDir, repo, msg string) {
+	t.Helper()
+	repoPath := filepath.Join(installDir, "repos", repo+".git")
+	work := t.TempDir()
+	mustRun(t, "git", "clone", repoPath, work)
+	mustRun(t, "git", "-C", work, "-c", "user.email=t@test", "-c", "user.name=t",
+		"commit", "--allow-empty", "-m", msg)
+	mustRun(t, "git", "-C", work, "push", "origin", "HEAD:refs/heads/main")
+}
+
 func TestBackupInvalidTarget(t *testing.T) {
 	_, env := backupSetup(t, "a1")
 	out, err := run(env, "backup", "a1", "unknown:foo", "--no-colour")
@@ -538,14 +551,14 @@ func TestBackupSshToLocalDir(t *testing.T) {
 		t.Fatalf("backup failed: %v\n%s", err, out)
 	}
 
-	// Local staging copy.
-	localBundle := filepath.Join(installDir, "bundles", "a1.bundle")
+	// Local staging copy is now under bundles/<repo>/full.bundle.
+	localBundle := filepath.Join(installDir, "bundles", "a1", "full.bundle")
 	if _, err := os.Stat(localBundle); err != nil {
 		t.Errorf("local bundle missing: %v", err)
 	}
 
 	// Destination copy.
-	destBundle := filepath.Join(destDir, "a1.bundle")
+	destBundle := filepath.Join(destDir, "a1", "full.bundle")
 	if _, err := os.Stat(destBundle); err != nil {
 		t.Errorf("bundle did not arrive at destination: %v", err)
 	}
@@ -664,7 +677,7 @@ func TestStatusWithRepoAndBundle(t *testing.T) {
 	}
 
 	// Bundle row should reference a size and age if rsync ran.
-	if _, err := os.Stat(filepath.Join(installDir, "bundles", "a1.bundle")); err == nil {
+	if _, err := os.Stat(filepath.Join(installDir, "bundles", "a1", "full.bundle")); err == nil {
 		if !strings.Contains(out, "B") && !strings.Contains(out, "KiB") && !strings.Contains(out, "MiB") {
 			t.Errorf("expected a humanised size in output, got:\n%s", out)
 		}
@@ -725,19 +738,309 @@ func TestBackupGdriveStubbed(t *testing.T) {
 		t.Fatalf("backup failed: %v\n%s", err, out)
 	}
 
-	// Verify rclone was called with the right copy command.
+	// First backup is full (no prior marker) → rclone sync with the per-repo
+	// destination subdir.
 	logBytes, err := os.ReadFile(rcloneLog)
 	if err != nil {
 		t.Fatalf("reading rclone log: %v", err)
 	}
 	log := string(logBytes)
-	if !strings.Contains(log, "copy") {
-		t.Errorf("rclone copy not invoked; log:\n%s", log)
+	if !strings.Contains(log, " sync ") {
+		t.Errorf("rclone sync not invoked on first (full) backup; log:\n%s", log)
 	}
-	if !strings.Contains(log, "gdrive:test-backups/") {
-		t.Errorf("rclone not called with gdrive:test-backups/; log:\n%s", log)
+	if !strings.Contains(log, "gdrive:test-backups/a1/") {
+		t.Errorf("rclone not called with per-repo subdir; log:\n%s", log)
 	}
-	if !strings.Contains(log, "a1.bundle") {
-		t.Errorf("rclone not called with bundle path; log:\n%s", log)
+}
+
+// --- incremental backup tests ------------------------------------------------
+
+func TestDestID(t *testing.T) {
+	a := destID("gdrive:vgit-backups/")
+	b := destID("gdrive:vgit-backups/")
+	c := destID("ssh:user@host:/path")
+
+	if a != b {
+		t.Errorf("same target gave different hashes: %q vs %q", a, b)
+	}
+	if a == c {
+		t.Errorf("different targets collided: both %q", a)
+	}
+	if len(a) != 12 {
+		t.Errorf("hash length: got %d, want 12", len(a))
+	}
+	for _, ch := range a {
+		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) {
+			t.Errorf("non-hex character %q in destID output", ch)
+		}
+	}
+}
+
+func TestCounterRoundtrip(t *testing.T) {
+	installDir, _ := backupSetup(t, "a1")
+	repoPath := filepath.Join(installDir, "repos", "a1.git")
+	const destHash = "deadbeef0000"
+
+	// Initial: unset means 0.
+	n, err := getCounter(repoPath, destHash)
+	if err != nil {
+		t.Fatalf("getCounter (initial): %v", err)
+	}
+	if n != 0 {
+		t.Errorf("initial counter: got %d, want 0", n)
+	}
+
+	if err := setCounter(repoPath, destHash, 42); err != nil {
+		t.Fatalf("setCounter: %v", err)
+	}
+	n, err = getCounter(repoPath, destHash)
+	if err != nil {
+		t.Fatalf("getCounter (after set): %v", err)
+	}
+	if n != 42 {
+		t.Errorf("after set: got %d, want 42", n)
+	}
+}
+
+func TestMarkerCreation(t *testing.T) {
+	installDir, _ := backupSetup(t, "a1")
+	repoPath := filepath.Join(installDir, "repos", "a1.git")
+	const destHash = "deadbeef1111"
+
+	// Before writeMarker, hasMarker reports false.
+	has, err := hasMarker(repoPath, destHash)
+	if err != nil {
+		t.Fatalf("hasMarker (before): %v", err)
+	}
+	if has {
+		t.Errorf("marker reported as existing before writeMarker")
+	}
+
+	if err := writeMarker(repoPath, destHash); err != nil {
+		t.Fatalf("writeMarker: %v", err)
+	}
+
+	has, err = hasMarker(repoPath, destHash)
+	if err != nil {
+		t.Fatalf("hasMarker (after): %v", err)
+	}
+	if !has {
+		t.Errorf("marker not found after writeMarker")
+	}
+
+	// Marker commit's parents should equal the current HEAD SHA (single ref).
+	headOut, err := exec.Command("git", "-C", repoPath, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v", err)
+	}
+	headSHA := strings.TrimSpace(string(headOut))
+
+	parentsOut, err := exec.Command("git", "-C", repoPath, "log", "-1", "--format=%P", markerRef(destHash)).Output()
+	if err != nil {
+		t.Fatalf("log marker: %v", err)
+	}
+	parents := strings.TrimSpace(string(parentsOut))
+	if parents != headSHA {
+		t.Errorf("marker parents: got %q, want %q", parents, headSHA)
+	}
+}
+
+func TestBackupFullThenIncr(t *testing.T) {
+	if _, err := exec.LookPath("rsync"); err != nil {
+		t.Skip("rsync not available")
+	}
+
+	installDir, env := backupSetup(t, "a1")
+	destDir := filepath.Join(t.TempDir(), "dest")
+	target := "ssh:" + destDir + "/"
+
+	// First backup → full (no prior marker).
+	out, err := run(env, "backup", "a1", target, "--no-colour")
+	if err != nil {
+		t.Fatalf("first backup: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "(full)") {
+		t.Errorf("expected '(full)' in output:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(destDir, "a1", "full.bundle")); err != nil {
+		t.Errorf("full.bundle missing on dest: %v", err)
+	}
+
+	pushCommitToRepo(t, installDir, "a1", "second commit")
+
+	// Second backup → incremental.
+	out, err = run(env, "backup", "a1", target, "--no-colour")
+	if err != nil {
+		t.Fatalf("second backup: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "(incremental)") {
+		t.Errorf("expected '(incremental)' in output:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(destDir, "a1", "incr.001.bundle")); err != nil {
+		t.Errorf("incr.001.bundle missing on dest: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(destDir, "a1", "full.bundle")); err != nil {
+		t.Errorf("full.bundle gone after incremental: %v", err)
+	}
+}
+
+func TestBackupNoNewCommits(t *testing.T) {
+	if _, err := exec.LookPath("rsync"); err != nil {
+		t.Skip("rsync not available")
+	}
+
+	_, env := backupSetup(t, "a1")
+	destDir := filepath.Join(t.TempDir(), "dest")
+	target := "ssh:" + destDir + "/"
+
+	// Full backup.
+	if out, err := run(env, "backup", "a1", target, "--no-colour"); err != nil {
+		t.Fatalf("full: %v\n%s", err, out)
+	}
+	// Second backup with no new commits.
+	out, err := run(env, "backup", "a1", target, "--no-colour")
+	if err != nil {
+		t.Fatalf("second: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "nothing new") {
+		t.Errorf("expected 'nothing new' in output:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(destDir, "a1", "incr.001.bundle")); err == nil {
+		t.Errorf("incr.001.bundle should not exist when nothing changed")
+	}
+}
+
+func TestBackupFullPrunesIncrementals(t *testing.T) {
+	if _, err := exec.LookPath("rsync"); err != nil {
+		t.Skip("rsync not available")
+	}
+
+	installDir, env := backupSetup(t, "a1")
+	destDir := filepath.Join(t.TempDir(), "dest")
+	target := "ssh:" + destDir + "/"
+
+	// Full + two incrementals.
+	if out, err := run(env, "backup", "a1", target, "--no-colour"); err != nil {
+		t.Fatalf("full: %v\n%s", err, out)
+	}
+	pushCommitToRepo(t, installDir, "a1", "c2")
+	if out, err := run(env, "backup", "a1", target, "--no-colour"); err != nil {
+		t.Fatalf("incr 1: %v\n%s", err, out)
+	}
+	pushCommitToRepo(t, installDir, "a1", "c3")
+	if out, err := run(env, "backup", "a1", target, "--no-colour"); err != nil {
+		t.Fatalf("incr 2: %v\n%s", err, out)
+	}
+	// All three bundles should exist on dest.
+	for _, f := range []string{"full.bundle", "incr.001.bundle", "incr.002.bundle"} {
+		if _, err := os.Stat(filepath.Join(destDir, "a1", f)); err != nil {
+			t.Fatalf("expected %s before --full, missing: %v", f, err)
+		}
+	}
+
+	// Force a fresh full.
+	if out, err := run(env, "backup", "a1", target, "--full", "--no-colour"); err != nil {
+		t.Fatalf("--full: %v\n%s", err, out)
+	}
+
+	// full.bundle should be present.
+	if _, err := os.Stat(filepath.Join(destDir, "a1", "full.bundle")); err != nil {
+		t.Errorf("full.bundle missing after --full: %v", err)
+	}
+	// incrementals should be pruned.
+	for _, f := range []string{"incr.001.bundle", "incr.002.bundle"} {
+		if _, err := os.Stat(filepath.Join(destDir, "a1", f)); err == nil {
+			t.Errorf("%s should have been pruned after --full", f)
+		}
+	}
+}
+
+func TestBackupChainRestores(t *testing.T) {
+	if _, err := exec.LookPath("rsync"); err != nil {
+		t.Skip("rsync not available")
+	}
+
+	installDir, env := backupSetup(t, "a1")
+	destDir := filepath.Join(t.TempDir(), "dest")
+	target := "ssh:" + destDir + "/"
+
+	// Full + two incrementals (3 commits total when done).
+	if out, err := run(env, "backup", "a1", target, "--no-colour"); err != nil {
+		t.Fatalf("full: %v\n%s", err, out)
+	}
+	pushCommitToRepo(t, installDir, "a1", "c2")
+	if out, err := run(env, "backup", "a1", target, "--no-colour"); err != nil {
+		t.Fatalf("incr 1: %v\n%s", err, out)
+	}
+	pushCommitToRepo(t, installDir, "a1", "c3")
+	if out, err := run(env, "backup", "a1", target, "--no-colour"); err != nil {
+		t.Fatalf("incr 2: %v\n%s", err, out)
+	}
+
+	// Reconstruct from the bundles.
+	restoreDir := filepath.Join(t.TempDir(), "restored")
+	mustRun(t, "git", "clone", filepath.Join(destDir, "a1", "full.bundle"), restoreDir)
+	mustRun(t, "git", "-C", restoreDir, "fetch",
+		filepath.Join(destDir, "a1", "incr.001.bundle"), "+refs/*:refs/*")
+	mustRun(t, "git", "-C", restoreDir, "fetch",
+		filepath.Join(destDir, "a1", "incr.002.bundle"), "+refs/*:refs/*")
+
+	out, err := exec.Command("git", "-C", restoreDir, "rev-list", "--count", "--all").Output()
+	if err != nil {
+		t.Fatalf("rev-list: %v", err)
+	}
+	count := strings.TrimSpace(string(out))
+	if count != "3" {
+		t.Errorf("restored repo has %s commits, want 3 (full + 2 incrementals)", count)
+	}
+}
+
+func TestBackupPerDestinationState(t *testing.T) {
+	if _, err := exec.LookPath("rsync"); err != nil {
+		t.Skip("rsync not available")
+	}
+
+	installDir, env := backupSetup(t, "a1")
+	dest1 := filepath.Join(t.TempDir(), "dest1")
+	dest2 := filepath.Join(t.TempDir(), "dest2")
+	target1 := "ssh:" + dest1 + "/"
+	target2 := "ssh:" + dest2 + "/"
+
+	// Full to both destinations (each gets its own marker).
+	if out, err := run(env, "backup", "a1", target1, "--no-colour"); err != nil {
+		t.Fatalf("full dest1: %v\n%s", err, out)
+	}
+	if out, err := run(env, "backup", "a1", target2, "--no-colour"); err != nil {
+		t.Fatalf("full dest2: %v\n%s", err, out)
+	}
+
+	pushCommitToRepo(t, installDir, "a1", "c2")
+
+	// Incremental to each → both should produce incr.001 (independent counters).
+	if out, err := run(env, "backup", "a1", target1, "--no-colour"); err != nil {
+		t.Fatalf("incr dest1: %v\n%s", err, out)
+	}
+	if out, err := run(env, "backup", "a1", target2, "--no-colour"); err != nil {
+		t.Fatalf("incr dest2: %v\n%s", err, out)
+	}
+
+	for _, d := range []string{dest1, dest2} {
+		for _, f := range []string{"full.bundle", "incr.001.bundle"} {
+			if _, err := os.Stat(filepath.Join(d, "a1", f)); err != nil {
+				t.Errorf("%s/a1/%s missing: %v", d, f, err)
+			}
+		}
+	}
+
+	// Two distinct marker refs should exist under refs/vgit/dest/.
+	repoPath := filepath.Join(installDir, "repos", "a1.git")
+	out, err := exec.Command("git", "-C", repoPath, "for-each-ref",
+		"--format=%(refname)", "refs/vgit/dest/").Output()
+	if err != nil {
+		t.Fatalf("for-each-ref: %v", err)
+	}
+	refs := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(refs) != 2 {
+		t.Errorf("expected 2 marker refs, got %d:\n%s", len(refs), strings.Join(refs, "\n"))
 	}
 }

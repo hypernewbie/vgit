@@ -59,6 +59,12 @@ func runRepoInit(cmd *cobra.Command, args []string) error {
 	if err := runQuiet("git", "init", "--bare", repoPath); err != nil {
 		return fmt.Errorf("git init --bare: %w", err)
 	}
+	// Pin HEAD to refs/heads/main regardless of the host's init.defaultBranch
+	// so clones don't end up with a broken symbolic HEAD when the user pushes
+	// "main" from elsewhere.
+	if err := runQuiet("git", "-C", repoPath, "symbolic-ref", "HEAD", "refs/heads/main"); err != nil {
+		return fmt.Errorf("setting HEAD to main: %w", err)
+	}
 	fmt.Printf("vgit: created bare repo at %s\n", bold(repoPath))
 
 	// Optional description.
