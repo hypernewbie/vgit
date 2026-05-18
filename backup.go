@@ -341,11 +341,15 @@ func uploadFull(target, targetType, repo, stagingDir string, cfg *Config) error 
 	switch targetType {
 	case "gdrive":
 		configFile := filepath.Join(cfg.Install.Dir, "config", "rclone.conf")
-		// `rclone sync` = copy + delete dest-only files.
+		// `rclone sync` = copy + delete dest-only files. rclone creates
+		// missing gdrive folders automatically.
 		return runInteractive("rclone", "--config", configFile, "sync", "--progress",
 			stagingDir+"/", destPath)
 	case "ssh":
-		return runInteractive("rsync", "-az", "--progress", "--delete", "--mkpath",
+		if err := ensureSSHDestDir(target, repo); err != nil {
+			return err
+		}
+		return runInteractive("rsync", "-az", "--progress", "--delete",
 			stagingDir+"/", destPath)
 	}
 	return fmt.Errorf("unknown target type %q", targetType)
@@ -361,10 +365,34 @@ func uploadIncr(target, targetType, repo, stagingDir string, cfg *Config) error 
 		return runInteractive("rclone", "--config", configFile, "copy", "--progress",
 			stagingDir+"/", destPath)
 	case "ssh":
-		return runInteractive("rsync", "-az", "--progress", "--mkpath",
+		if err := ensureSSHDestDir(target, repo); err != nil {
+			return err
+		}
+		return runInteractive("rsync", "-az", "--progress",
 			stagingDir+"/", destPath)
 	}
 	return fmt.Errorf("unknown target type %q", targetType)
+}
+
+// ensureSSHDestDir creates the per-repo destination directory under the
+// target. macOS and older Linux ship rsync 3.1.x which doesn't understand
+// --mkpath, so we create the directory explicitly first: locally with
+// os.MkdirAll for plain paths, or via `ssh <host> mkdir -p ...` for remote
+// targets. ssh joins args after the host into a single command that the
+// remote shell evaluates, so a leading `~` in the path expands naturally.
+func ensureSSHDestDir(target, repo string) error {
+	firstSlash := strings.Index(target, "/")
+	firstColon := strings.Index(target, ":")
+	isRemote := firstColon >= 0 && (firstSlash < 0 || firstColon < firstSlash)
+
+	if !isRemote {
+		return os.MkdirAll(filepath.Join(target, repo), 0o755)
+	}
+
+	parts := strings.SplitN(target, ":", 2)
+	host, remotePath := parts[0], parts[1]
+	fullPath := strings.TrimRight(remotePath, "/") + "/" + repo
+	return runQuiet("ssh", host, "mkdir", "-p", fullPath)
 }
 
 // parseBackupTarget splits a target like "gdrive:path" or "ssh:user@host:path"
