@@ -1,0 +1,18 @@
+# Compiled binary (matches the module name; `go build .` drops it at the repo root)
+/vgit
+
+# Go test artifacts
+*.test
+*.out
+coverage.*
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS noise
+.DS_Store
+Thumbs.db
